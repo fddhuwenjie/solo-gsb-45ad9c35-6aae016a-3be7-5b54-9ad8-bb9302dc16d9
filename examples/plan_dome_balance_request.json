@@ -1,0 +1,13 @@
+{
+  "installed_parts": [
+    {"mass": 10.0, "radius": 1.0, "azimuth": 0.0}
+  ],
+  "slots": [
+    {"id": "A", "radius": 1.0, "azimuth": 170.0, "mass_limit": 20.0},
+    {"id": "B", "radius": 1.0, "azimuth": 190.0, "mass_limit": 20.0}
+  ],
+  "mass_step": 0.5,
+  "mass_tolerance_ratio": 0.05,
+  "azimuth_tolerance": 1.0,
+  "residual_moment_limit": 1.0
+}

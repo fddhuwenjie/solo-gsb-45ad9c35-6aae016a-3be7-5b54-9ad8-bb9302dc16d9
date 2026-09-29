@@ -1,0 +1,20 @@
+{
+  "dome_radius": 10.0,
+  "origin": {"east": 1.5, "north": -0.8, "up": 2.0},
+  "samples": [
+    {
+      "index": 0,
+      "azimuth": 350.0,
+      "elevation": 40.0,
+      "azimuth_error": 2.0,
+      "elevation_error": 1.0
+    },
+    {
+      "index": 1,
+      "azimuth": 120.0,
+      "elevation": 60.0,
+      "azimuth_error": 0.5,
+      "elevation_error": 0.5
+    }
+  ]
+}
