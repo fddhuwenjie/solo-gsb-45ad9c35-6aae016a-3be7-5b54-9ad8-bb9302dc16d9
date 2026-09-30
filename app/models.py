@@ -11,6 +11,7 @@ from .planner.balance import (
     MAX_LEVELS_PER_SLOT as BALANCE_MAX_LEVELS_PER_SLOT,
 )
 from .planner.balance import MAX_SLOTS as BALANCE_MAX_SLOTS
+from .planner.resequence import MAX_WEIGHTS as RESEQUENCE_MAX_WEIGHTS
 from .planner.calibration import (
     MAX_LAG_CANDIDATES,
     unwrap_shortest_arc,
@@ -640,4 +641,185 @@ class PlanDomeBalanceResponse(BaseModel):
         "max_scenarios_per_plan（单方案最多偏差情景数）、"
         "mass_vector（按槽位 ID 排列的质量向量，未使用槽位记 0）、"
         "slot_ids（质量向量各分量对应的槽位 ID）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/plan-weight-sequence
+# ---------------------------------------------------------------------------
+
+
+class OperableWeight(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="可操作配重 ID（非空字符串，请求内唯一）"
+    )
+    mass: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="配重质量（>= 0）"
+    )
+    radius: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="配重质心到旋转轴的半径（>= 0）",
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="配重相对旋转轴的方位角（度，北为 0°、向东递增，"
+        "可取任意实数，跨 0° 无需特判）",
+    )
+
+
+class PlanWeightSequenceRequest(BaseModel):
+    fixed_parts: list[InstalledPart] = Field(
+        default_factory=list,
+        description="固定部件清单（不可拆装，质量与质量矩始终在底座上）；"
+        "可为空",
+    )
+    weights: list[OperableWeight] = Field(
+        ..., max_length=RESEQUENCE_MAX_WEIGHTS,
+        description="可操作配重（**最多 12 件**，ID 非空且唯一）："
+        "每件具有质量、半径与方位",
+    )
+    current_ids: list[str] = Field(
+        ..., description="当前在位配重 ID 列表（均须为已知 ID，重复自动去重）"
+    )
+    target_ids: list[str] = Field(
+        ..., description="目标在位配重 ID 列表（均须为已知 ID，重复自动去重）"
+    )
+    installed_mass_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="在位总质量上限（固定部件 + 在位配重，>= 0）；"
+        "每步结束（含起止状态）均不得越限",
+    )
+    residual_moment_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="残余质量矩模长上限（>= 0）；每步结束（含起止状态）"
+        "均不得越限",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PlanWeightSequenceRequest":
+        ids = [w.id for w in self.weights]
+        if len(set(ids)) != len(ids):
+            raise ValueError("weights 的 id 必须唯一")
+        known = set(ids)
+        unknown_current = [i for i in self.current_ids if i not in known]
+        if unknown_current:
+            raise ValueError(
+                f"current_ids 包含未知配重 ID：{unknown_current}"
+            )
+        unknown_target = [i for i in self.target_ids if i not in known]
+        if unknown_target:
+            raise ValueError(
+                f"target_ids 包含未知配重 ID：{unknown_target}"
+            )
+        return self
+
+
+class WeightSequenceState(BaseModel):
+    installed_ids: list[str] = Field(
+        ..., description="在位配重 ID 列表（升序）"
+    )
+    total_mass: float = Field(..., description="在位总质量（固定部件 + 配重）")
+    residual: MomentVector2 = Field(..., description="残余质量矩向量")
+    residual_magnitude: float = Field(..., description="残余质量矩模长")
+
+
+class WeightSequenceStep(BaseModel):
+    index: int = Field(..., description="步号（1 基）")
+    action: Literal["install", "remove"] = Field(
+        ..., description="动作类型：install（装上）/ remove（拆下）"
+    )
+    weight_id: str = Field(..., description="本步操作的配重 ID")
+    installed_ids: list[str] = Field(
+        ..., description="本步结束后的在位配重 ID（升序）"
+    )
+    total_mass: float = Field(..., description="本步结束后的在位总质量")
+    residual: MomentVector2 = Field(
+        ..., description="本步结束后的残余质量矩向量"
+    )
+    residual_magnitude: float = Field(
+        ..., description="本步结束后的残余质量矩模长"
+    )
+    temporary: bool = Field(
+        ..., description="本步操作的配重是否为临时配重"
+        "（起点不在位、目标集合外，中途借来且最终拆除）"
+    )
+
+
+class BlockedWeightAction(BaseModel):
+    action: Literal["install", "remove"] = Field(
+        ..., description="被阻断动作类型：install / remove"
+    )
+    weight_id: str = Field(..., description="被阻断动作操作的配重 ID")
+    from_depth: int = Field(
+        ..., description="来源状态距起点的动作步数（0 即起点）"
+    )
+    from_installed_ids: list[str] = Field(
+        ..., description="动作执行前来源状态的在位配重 ID（升序）"
+    )
+    resulting_installed_ids: list[str] = Field(
+        ..., description="动作若执行后在位配重 ID（升序；该状态越限）"
+    )
+    resulting_total_mass: float = Field(
+        ..., description="动作若执行后的在位总质量（已越限）"
+    )
+    resulting_residual: MomentVector2 = Field(
+        ..., description="动作若执行后的残余质量矩向量（已越限）"
+    )
+    resulting_residual_magnitude: float = Field(
+        ..., description="动作若执行后的残余质量矩模长（已越限）"
+    )
+    moment_excess: float = Field(
+        ..., description="质量矩超限量（= max(0, 模长 − 限值)，边界容差 1e-9）"
+    )
+    mass_excess: float = Field(
+        ..., description="总质量超限量（= max(0, 总质量 − 限值)，边界容差 1e-9）"
+    )
+
+
+class PlanWeightSequenceResponse(BaseModel):
+    feasible: bool = Field(
+        ..., description="是否存在满足全部安全约束的换装路径"
+    )
+    fixed_total_mass: float = Field(..., description="固定部件总质量")
+    fixed_moment: MomentVector2 = Field(
+        ..., description="固定部件合成质量矩向量"
+    )
+    fixed_moment_magnitude: float = Field(
+        ..., description="固定部件合成质量矩模长"
+    )
+    installed_mass_limit: float = Field(..., description="在位总质量上限（回显）")
+    residual_moment_limit: float = Field(
+        ..., description="残余质量矩模长上限（回显）"
+    )
+    initial_state: WeightSequenceState = Field(..., description="起点状态")
+    target_state: WeightSequenceState = Field(..., description="终点状态")
+    target_ids: list[str] = Field(
+        ..., description="目标在位配重 ID（升序回显）"
+    )
+    steps: list[WeightSequenceStep] = Field(
+        default_factory=list,
+        description="逐步换装动作（动作最少；无路时为空列表）",
+    )
+    temporary_weight_ids: list[str] = Field(
+        default_factory=list,
+        description="路径上使用过的临时配重 ID（升序）：起点不在位且目标外、"
+        "中途借来最终拆除的配重；换装结束时它们均已拆除，终态恰为目标集合",
+    )
+    reachable_states: int = Field(
+        ..., description="从起点可达的合法状态数（含起点）"
+    )
+    max_intermediate_magnitude: float = Field(
+        0.0,
+        description="所选路径各步结束残余模长的最大值（同长度择优键；"
+        "无路时为 0）",
+    )
+    nearest_blocked_action: BlockedWeightAction | None = Field(
+        None,
+        description="无路时从可达状态出发的“最近一步”被阻断动作"
+        "（依次按质量矩超限量、总质量超限量、动作字典序取最小）；"
+        "有解时为 null",
+    )
+    details: dict = Field(
+        default_factory=dict,
+        description="诊断：explored_states（穷举的掩码状态总数，= 2^配重建数）",
     )

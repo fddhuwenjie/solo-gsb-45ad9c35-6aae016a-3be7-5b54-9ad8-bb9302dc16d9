@@ -30,6 +30,11 @@ from .models import (
     PlanDomeBalanceResponse,
     BalanceWeightItem,
     MomentVector2,
+    PlanWeightSequenceRequest,
+    PlanWeightSequenceResponse,
+    WeightSequenceState,
+    WeightSequenceStep,
+    BlockedWeightAction,
     TrackRequest,
     TrackResponse,
     WorstDeviationItem,
@@ -45,6 +50,10 @@ from .planner.aperture import (
 from .planner.balance import Slot, plan_balance, slot_levels
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
+from .planner.resequence import (
+    WeightSequenceValidationError,
+    plan_weight_sequence,
+)
 from .planner.solver import Problem, solve
 
 app = FastAPI(
@@ -78,6 +87,14 @@ async def aperture_validation_error_handler(
     _request: Request, exc: ApertureValidationError
 ) -> JSONResponse:
     # 视轴起点不在球内 / 误差越出高度角范围 / 交点低于地平面 → HTTP 422
+    return JSONResponse(status_code=422, content=exc.payload)
+
+
+@app.exception_handler(WeightSequenceValidationError)
+async def weight_sequence_validation_error_handler(
+    _request: Request, exc: WeightSequenceValidationError
+) -> JSONResponse:
+    # 起点或终点状态本身越限（总质量/残余质量矩）→ HTTP 422
     return JSONResponse(status_code=422, content=exc.payload)
 
 
@@ -428,4 +445,89 @@ def plan_dome_balance(
             "slot_ids": list(plan.slot_ids),
             "mass_vector": [round(m, 9) for m in plan.mass_vector],
         },
+    )
+
+
+def _weight_sequence_state_model(snap) -> WeightSequenceState:
+    return WeightSequenceState(
+        installed_ids=list(snap.installed_ids),
+        total_mass=round(snap.total_mass, 9),
+        residual=MomentVector2(
+            east=round(snap.residual_east, 9),
+            north=round(snap.residual_north, 9),
+        ),
+        residual_magnitude=round(snap.residual_magnitude, 9),
+    )
+
+
+@app.post(
+    "/api/v1/plan-weight-sequence",
+    response_model=PlanWeightSequenceResponse,
+    tags=["balance"],
+)
+def plan_weight_sequence_endpoint(
+    req: PlanWeightSequenceRequest,
+) -> PlanWeightSequenceResponse:
+    plan = plan_weight_sequence(
+        fixed_parts=[(p.mass, p.radius, p.azimuth) for p in req.fixed_parts],
+        weight_items=[(w.id, w.mass, w.radius, w.azimuth) for w in req.weights],
+        current_ids=set(req.current_ids),
+        target_ids=set(req.target_ids),
+        installed_mass_limit=req.installed_mass_limit,
+        residual_moment_limit=req.residual_moment_limit,
+    )
+
+    blocked = None
+    if plan.nearest_blocked_action is not None:
+        b = plan.nearest_blocked_action
+        blocked = BlockedWeightAction(
+            action=b.action,
+            weight_id=b.weight_id,
+            from_depth=b.from_depth,
+            from_installed_ids=list(b.from_installed_ids),
+            resulting_installed_ids=list(b.resulting_installed_ids),
+            resulting_total_mass=round(b.resulting_total_mass, 9),
+            resulting_residual=MomentVector2(
+                east=round(b.resulting_residual_east, 9),
+                north=round(b.resulting_residual_north, 9),
+            ),
+            resulting_residual_magnitude=round(b.resulting_residual_magnitude, 9),
+            moment_excess=round(b.moment_excess, 9),
+            mass_excess=round(b.mass_excess, 9),
+        )
+
+    return PlanWeightSequenceResponse(
+        feasible=plan.feasible,
+        fixed_total_mass=round(plan.fixed_mass, 9),
+        fixed_moment=MomentVector2(
+            east=round(plan.fixed_moment_x, 9),
+            north=round(plan.fixed_moment_y, 9),
+        ),
+        fixed_moment_magnitude=round(plan.fixed_moment_magnitude, 9),
+        installed_mass_limit=round(plan.installed_mass_limit, 9),
+        residual_moment_limit=round(plan.residual_moment_limit, 9),
+        initial_state=_weight_sequence_state_model(plan.initial),
+        target_state=_weight_sequence_state_model(plan.target),
+        target_ids=list(plan.target_ids),
+        steps=[
+            WeightSequenceStep(
+                index=s.index,
+                action=s.action,
+                weight_id=s.weight_id,
+                installed_ids=list(s.installed_ids),
+                total_mass=round(s.total_mass, 9),
+                residual=MomentVector2(
+                    east=round(s.residual_east, 9),
+                    north=round(s.residual_north, 9),
+                ),
+                residual_magnitude=round(s.residual_magnitude, 9),
+                temporary=s.temporary,
+            )
+            for s in plan.steps
+        ],
+        temporary_weight_ids=list(plan.temporary_weight_ids),
+        reachable_states=plan.reachable_states,
+        max_intermediate_magnitude=round(plan.max_intermediate_magnitude, 9),
+        nearest_blocked_action=blocked,
+        details={"explored_states": plan.explored_states},
     )

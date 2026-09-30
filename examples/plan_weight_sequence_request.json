@@ -1,0 +1,15 @@
+{
+  "fixed_parts": [
+    {"mass": 10.0, "radius": 1.0, "azimuth": 0.0}
+  ],
+  "weights": [
+    {"id": "A", "mass": 5.0, "radius": 2.0, "azimuth": 180.0},
+    {"id": "B", "mass": 5.0, "radius": 2.0, "azimuth": 150.0},
+    {"id": "C", "mass": 5.0, "radius": 2.0, "azimuth": 210.0},
+    {"id": "T", "mass": 2.0, "radius": 4.0, "azimuth": 180.0}
+  ],
+  "current_ids": ["A"],
+  "target_ids": ["B", "C"],
+  "installed_mass_limit": 20.0,
+  "residual_moment_limit": 9.0
+}

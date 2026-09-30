@@ -577,6 +577,146 @@ curl -X POST http://localhost:8000/api/v1/plan-dome-balance \
 超过 40 个、`mass_tolerance_ratio` 不在 [0, 1)、方位偏差或限值为负、
 质量/半径为负、NaN/无穷大等。
 
+### POST `/api/v1/plan-weight-sequence`
+
+圆顶检修时的**配重换装顺序规划**：给定**固定部件**（不可拆装）与最多
+**12 件**带唯一 ID、质量、半径、方位的**可操作配重**，以及当前在位 ID
+集合、目标 ID 集合、**在位总质量上限**与**残余质量矩限值**，在状态图上
+搜索动作最少的安全换装路径。目标集合之外的配重允许**临时**借用，但换装
+结束时必须全部拆除（终态恰好等于目标集合）。
+
+动作与安全约束：
+
+- 一次只**装上（`install`）一件**不在位配重，或**拆下（`remove`
+  一件）**在位配重；
+- **每一步结束后**（含起点与终点状态）：在位总质量（固定部件 +
+  在位配重）不超过 `installed_mass_limit`，残余质量矩模长不超过
+  `residual_moment_limit`（边界 1e-9 内视为达标）；
+- 方位与质量矩约定同 `plan-dome-balance`：北为 0°、向东递增，
+  `m·r·(sin a, cos a)`，x=东向、y=北向，跨 0° 无需特判。
+
+**请求字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `fixed_parts` | object[] | 固定部件（可为空）：`mass`（≥ 0）、`radius`（≥ 0）、`azimuth`（度） |
+| `weights` | object[] | 可操作配重（**最多 12 件**，ID 非空且唯一）：`id`、`mass`、`radius`、`azimuth` |
+| `current_ids` | string[] | 当前在位配重 ID（均须已知；重复自动去重） |
+| `target_ids` | string[] | 目标在位配重 ID（均须已知；重复自动去重） |
+| `installed_mass_limit` | number | 在位总质量上限（≥ 0），每步结束不得越限 |
+| `residual_moment_limit` | number | 残余质量矩模长上限（≥ 0），每步结束不得越限 |
+
+搜索与并列规则：状态为各配重在位与否的位掩码（≤ 12 件 → 至多 4096
+个状态），仅安全状态可通行；装/拆一条边，最短路即逐层 BFS。同为最短
+路径时依次按以下键择优（模长差不超过 1e-9 视为并列）：
+
+1. 路径各步结束残余质量矩模长的**最大值**（中间残余较小者优）；
+2. **动作序列字典序**：动作类型 `install < remove`（英文字母序），
+   同类动作按配重 ID 字符串升序。
+
+**示例请求**：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/plan-weight-sequence \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan_weight_sequence_request.json
+```
+
+场景：固定部件 `10@0°`（r=1，矩 10 向北）；当前 `A=5kg,r2@180°`
+（矩 10 向南，恰好抵消）；目标为 `B=5kg,r2@150°` 与 `C=5kg,r2@210°`；
+临时配重 `T=2kg,r4@180°`（矩 8 向南）。质量上限 20、矩限值 9：直接装
+B 会使残余模长达到 10 越限，因此必须先用 T 搭桥。响应（节选）：
+
+```json
+{
+  "feasible": true,
+  "fixed_total_mass": 10.0,
+  "fixed_moment": {"east": 0.0, "north": 10.0},
+  "installed_mass_limit": 20.0,
+  "residual_moment_limit": 9.0,
+  "initial_state": {
+    "installed_ids": ["A"], "total_mass": 15.0,
+    "residual": {"east": 0.0, "north": 0.0}, "residual_magnitude": 0.0
+  },
+  "target_state": {
+    "installed_ids": ["B", "C"], "total_mass": 20.0,
+    "residual": {"east": -0.0, "north": -7.320508076},
+    "residual_magnitude": 7.320508076
+  },
+  "steps": [
+    {"index": 1, "action": "install", "weight_id": "T",
+     "installed_ids": ["A", "T"], "total_mass": 17.0,
+     "residual": {"east": 0.0, "north": -8.0},
+     "residual_magnitude": 8.0, "temporary": true},
+    {"index": 2, "action": "remove", "weight_id": "A",
+     "installed_ids": ["T"], "total_mass": 12.0,
+     "residual": {"east": 0.0, "north": 2.0},
+     "residual_magnitude": 2.0, "temporary": false},
+    {"index": 3, "action": "install", "weight_id": "B",
+     "installed_ids": ["B", "T"], "total_mass": 17.0,
+     "residual": {"east": 5.0, "north": -6.660254038},
+     "residual_magnitude": 8.328204119, "temporary": false},
+    {"index": 4, "action": "remove", "weight_id": "T",
+     "installed_ids": ["B"], "total_mass": 15.0,
+     "residual": {"east": 5.0, "north": 1.339745962},
+     "residual_magnitude": 5.176380902, "temporary": true},
+    {"index": 5, "action": "install", "weight_id": "C",
+     "installed_ids": ["B", "C"], "total_mass": 20.0,
+     "residual": {"east": -0.0, "north": -7.320508076},
+     "residual_magnitude": 7.320508076, "temporary": false}
+  ],
+  "temporary_weight_ids": ["T"],
+  "reachable_states": 8,
+  "max_intermediate_magnitude": 8.328204119,
+  "nearest_blocked_action": null,
+  "details": {"explored_states": 16}
+}
+```
+
+`temporary_weight_ids` 为路径上使用过的**临时配重**（起点不在位、目标
+之外、中途借来且最终拆除）；起点在位而终点拆除的旧配重属于正常换装
+对象。各步 `temporary` 标记本步操作的配重是否为临时配重；末步
+`installed_ids` 恰为目标集合。
+
+**起点或终点越限 → HTTP 422**：载荷 `reason` 为
+`current_state_violates_limits` / `target_state_violates_limits`
+（起点优先报告），并给出该状态的 `total_mass`/`mass_excess`、
+`residual`/`moment_excess` 与两个限值。
+
+**其余无路情形 → HTTP 200、`feasible: false`**：返回
+`reachable_states`（从起点可达的合法状态数，含起点）与
+`nearest_blocked_action`——从可达状态出发、指向越限状态的全部被阻断
+动作中的“最近一步”，依次按 **质量矩超限量**（`moment_excess`）、
+**总质量超限量**（`mass_excess`）、动作字典序（`install < remove`，
+再按 ID）取最小者，并回显来源状态距起点的步数 `from_depth`、动作前后
+在位 ID 与执行后的越限物理量。例如把上例的临时件 T 去掉、矩限值收紧
+到 5（`examples/plan_weight_sequence_request_infeasible.json`）：
+
+```json
+{
+  "feasible": false,
+  "reachable_states": 3,
+  "steps": [],
+  "temporary_weight_ids": [],
+  "nearest_blocked_action": {
+    "action": "remove",
+    "weight_id": "A",
+    "from_depth": 1,
+    "from_installed_ids": ["A", "B"],
+    "resulting_installed_ids": ["B"],
+    "resulting_total_mass": 12.5,
+    "resulting_residual": {"east": 0.868240888, "north": 5.075961235},
+    "resulting_residual_magnitude": 5.149682,
+    "moment_excess": 0.149682,
+    "mass_excess": 0.0
+  },
+  "details": {"explored_states": 8}
+}
+```
+
+**HTTP 422（结构/参数非法）**：配重超过 12 件、ID 为空或重复、
+`current_ids`/`target_ids` 含未知 ID、质量/半径/限值为负、NaN/无穷大等。
+
 ## 算法说明
 
 角度使用**未展开（unwrapped）**表示，因此跨 0°/360° 的跟踪不需要特判：每个
@@ -619,7 +759,7 @@ python3 scripts/fuzz_check.py
 
 ```
 app/
-  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance
+  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance、/api/v1/plan-weight-sequence
   models.py            # Pydantic 请求/响应模型与参数校验
   planner/
     geometry.py        # 方位归一化、狭缝窗口（lift）、线缆裁剪、区间合并
@@ -629,9 +769,10 @@ app/
     interlock.py       # 安全联锁审计：分段常值重放、天气状态机、关闭义务
     aperture.py        # 视轴射线-偏心球面稳定求交、球面方位/高度、最短覆盖圆弧开口包络
     balance.py         # 静平衡配重：≤2 槽精确枚举、9^k 偏差情景穷举、四级并列择优
-examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重）
+    resequence.py      # 配重换装顺序：位掩码状态图逐层 BFS、最短路 + 最大残余/动作字典序并列、无路阻断动作诊断
+examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重、配重换装有解/无路）
 scripts/fuzz_check.py  # 与网格暴力 DP 的随机对拍
-tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重（含独立暴力对拍）、HTTP API 测试
+tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重、配重换装（含独立暴力 BFS 对拍）、HTTP API 测试
 Dockerfile
 docker-compose.yml
 ```
