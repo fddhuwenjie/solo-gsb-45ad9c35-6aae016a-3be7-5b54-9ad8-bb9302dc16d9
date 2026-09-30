@@ -577,6 +577,130 @@ curl -X POST http://localhost:8000/api/v1/plan-dome-balance \
 超过 40 个、`mass_tolerance_ratio` 不在 [0, 1)、方位偏差或限值为负、
 质量/半径为负、NaN/无穷大等。
 
+### POST `/api/v1/plan-weight-swap`
+
+圆顶检修时的**配重换装顺序规划**：给定始终在位的**固定部件**与最多
+**12 件**带唯一 ID、质量、半径和方位的**可操作配重**，以及当前在位 ID
+集合 `current_ids`、目标 ID 集合 `target_ids`、**在位总质量上限**与
+**残余质量矩限值**，搜索从当前集合换装到目标集合、**动作步数最少**的安全
+路径。目标集合之外的配重允许**临时在位**（辅助换装），但路径终点必须恰为
+目标集合——临时配重最终全部拆除。
+
+- 每一步对**恰好一件**配重执行 `install`（装上）或 `remove`（拆下）；
+- 每步结束后的**在位总质量**（固定部件 + 在位配重）不得超过
+  `installed_mass_limit`；
+- 每步结束后的**残余质量矩**（固定部件矩与在位配重矩同向叠加，方位沿用
+  北为 0°、向东递增：`(east, north) = m·r·(sin a, cos a)`）模长不得超过
+  `residual_moment_limit`；
+- 边界（差值 ≤ 1e-9）视为达标。
+
+**择优键（路径等长时依次比较）**：
+
+1. 路径上各步结束残余质量矩模长的**最大值**（小者优，1e-9 内并列）；
+2. 动作序列字典序：逐项比较 `(action, weight_id)`，`install < remove`，
+   同类动作按配重 ID 升序。
+
+**请求字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `fixed_parts` | object[] | 固定部件（始终在位、不可拆装；可为空数组）：`mass`（≥ 0）、`radius`（≥ 0）、`azimuth`（度） |
+| `weights` | object[] | 可操作配重（**1..12 件**，ID 非空且唯一）：`id`、`mass`（≥ 0）、`radius`（≥ 0）、`azimuth` |
+| `current_ids` | string[] | 当前在位配重 ID（须为 weights 子集、不重复） |
+| `target_ids` | string[] | 目标在位配重 ID（子集、不重复）；目标外配重可临时使用，终点必须全部拆除 |
+| `installed_mass_limit` | number | 在位总质量上限（≥ 0，**含固定部件质量**） |
+| `residual_moment_limit` | number | 残余质量矩模长限值（≥ 0，**含固定部件矩**） |
+
+**示例请求**（`examples/plan_weight_swap_request.json`）：固定部件
+`10@0°`（矩 +10 向北），配重 `A`/`B` 均为 `10@180°`（r=1）互为替换件，
+另有临时配重 `T = 2.5@180°`（r=2，矩 −5）；当前 `{A}`、目标 `{B}`，
+在位质量上限 25、残余矩限值 5。直接换装的两条 2 步路径分别被总质量
+（先装 B 需 30kg）与残余矩（先拆 A 剩 +10）阻断，规划器给出借助 T 的
+4 步安全路径：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/plan-weight-swap \
+  -H 'Content-Type: application/json' \
+  -d @examples/plan_weight_swap_request.json
+```
+
+```json
+{
+  "feasible": true,
+  "steps": [
+    {"index": 1, "action": "install", "weight_id": "T",
+     "installed_ids": ["A", "T"], "total_mass": 22.5,
+     "residual": {"east": 0.0, "north": -5.0}, "residual_magnitude": 5.0},
+    {"index": 2, "action": "remove", "weight_id": "A",
+     "installed_ids": ["T"], "total_mass": 12.5,
+     "residual": {"east": 0.0, "north": 5.0}, "residual_magnitude": 5.0},
+    {"index": 3, "action": "install", "weight_id": "B",
+     "installed_ids": ["B", "T"], "total_mass": 22.5,
+     "residual": {"east": 0.0, "north": -5.0}, "residual_magnitude": 5.0},
+    {"index": 4, "action": "remove", "weight_id": "T",
+     "installed_ids": ["B"], "total_mass": 20.0,
+     "residual": {"east": 0.0, "north": 0.0}, "residual_magnitude": 0.0}
+  ],
+  "reachable_states": 5,
+  "nearest_blocked": null,
+  "details": {
+    "current_ids": ["A"],
+    "target_ids": ["B"],
+    "fixed_part_count": 1,
+    "weight_ids": ["A", "B", "T"],
+    "installed_mass_limit": 25.0,
+    "residual_moment_limit": 5.0,
+    "start": {"total_mass": 20.0,
+              "residual": {"east": 0.0, "north": 0.0},
+              "residual_magnitude": 0.0},
+    "goal": {"total_mass": 20.0,
+             "residual": {"east": 0.0, "north": 0.0},
+             "residual_magnitude": 0.0}
+  }
+}
+```
+
+字段说明：
+
+- `steps[].installed_ids` 为该步结束后的在位可操作配重 ID（按 ID 升序）；
+  `residual` / `residual_magnitude` 为该步结束时含固定部件的残余矩向量与
+  模长；`total_mass` 为含固定部件的在位总质量；
+- `reachable_states`：自起点经安全动作可达的在位子集状态数（起点计入）；
+- `nearest_blocked`：有路径时为 `null`。
+
+**无路响应**（HTTP 200，`feasible: false`）：`steps` 为空，给出
+`reachable_states`，并在全部“从可达状态出发但落点越限”的阻断动作中，
+依次按 **质量矩超限量**、**总质量超限量**、**动作字典序**（源状态在位 ID
+兜底）取最小者，即离可行最近的一步 `nearest_blocked`。上例去掉 T 后：
+
+```json
+{
+  "feasible": false,
+  "steps": [],
+  "reachable_states": 1,
+  "nearest_blocked": {
+    "action": "remove",
+    "weight_id": "A",
+    "from_installed_ids": ["A"],
+    "total_mass": 10.0,
+    "mass_excess": 0.0,
+    "residual": {"east": 0.0, "north": 10.0},
+    "residual_magnitude": 10.0,
+    "moment_excess": 5.0
+  },
+  "details": { "...": "..." }
+}
+```
+
+即 `install B`（落点 30kg、矩 10：质量超限 5、矩超限 5）与 `remove A`
+（落点矩 10：仅矩超限 5）中，后者总质量超限量更小，故为“最近一步”。
+
+**HTTP 422**：**起点或终点状态本身越限**（响应体 `endpoint` 为
+`"start"` / `"goal"`，并回显在位 ID、总质量及超限量、残余向量/模长及
+超限量）；以及配重为空或超过 12 件、ID 为空或重复、
+`current_ids`/`target_ids` 重复或引用未知 ID、质量/半径或限值为负、
+NaN/无穷大等结构非法。
+
 ## 算法说明
 
 角度使用**未展开（unwrapped）**表示，因此跨 0°/360° 的跟踪不需要特判：每个
@@ -619,7 +743,7 @@ python3 scripts/fuzz_check.py
 
 ```
 app/
-  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance
+  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture、/api/v1/plan-dome-balance、/api/v1/plan-weight-swap
   models.py            # Pydantic 请求/响应模型与参数校验
   planner/
     geometry.py        # 方位归一化、狭缝窗口（lift）、线缆裁剪、区间合并
@@ -629,9 +753,10 @@ app/
     interlock.py       # 安全联锁审计：分段常值重放、天气状态机、关闭义务
     aperture.py        # 视轴射线-偏心球面稳定求交、球面方位/高度、最短覆盖圆弧开口包络
     balance.py         # 静平衡配重：≤2 槽精确枚举、9^k 偏差情景穷举、四级并列择优
-examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重）
+    swap.py            # 配重换装：安全子集状态图分层 BFS、最少步数与残余/字典序并列、阻断动作诊断
+examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影、静平衡配重、配重换装）
 scripts/fuzz_check.py  # 与网格暴力 DP 的随机对拍
-tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重（含独立暴力对拍）、HTTP API 测试
+tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、静平衡配重（含独立暴力对拍）、配重换装（含朴素 BFS 对拍）、HTTP API 测试
 Dockerfile
 docker-compose.yml
 ```

@@ -1,4 +1,5 @@
-"""FastAPI 入口：健康检查、圆顶狭缝跟踪求解与安全联锁审计接口。"""
+"""FastAPI 入口：健康检查、圆顶狭缝跟踪求解、安全联锁审计、
+静平衡配重规划与检修配重换装顺序规划接口。"""
 
 from __future__ import annotations
 
@@ -30,6 +31,10 @@ from .models import (
     PlanDomeBalanceResponse,
     BalanceWeightItem,
     MomentVector2,
+    PlanWeightSwapRequest,
+    PlanWeightSwapResponse,
+    SwapStepItem,
+    NearestBlockedItem,
     TrackRequest,
     TrackResponse,
     WorstDeviationItem,
@@ -46,6 +51,12 @@ from .planner.balance import Slot, plan_balance, slot_levels
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
 from .planner.solver import Problem, solve
+from .planner.swap import (
+    ACTION_TYPE_NAMES,
+    SwapValidationError,
+    Weight as SwapWeight,
+    plan_weight_swap,
+)
 
 app = FastAPI(
     title="天文台圆顶狭缝跟踪 API",
@@ -78,6 +89,14 @@ async def aperture_validation_error_handler(
     _request: Request, exc: ApertureValidationError
 ) -> JSONResponse:
     # 视轴起点不在球内 / 误差越出高度角范围 / 交点低于地平面 → HTTP 422
+    return JSONResponse(status_code=422, content=exc.payload)
+
+
+@app.exception_handler(SwapValidationError)
+async def swap_validation_error_handler(
+    _request: Request, exc: SwapValidationError
+) -> JSONResponse:
+    # 换装起点 / 终点在位总质量或残余质量矩越限 → HTTP 422
     return JSONResponse(status_code=422, content=exc.payload)
 
 
@@ -427,5 +446,94 @@ def plan_dome_balance(
             "max_scenarios_per_plan": plan.max_scenarios_per_plan,
             "slot_ids": list(plan.slot_ids),
             "mass_vector": [round(m, 9) for m in plan.mass_vector],
+        },
+    )
+
+
+@app.post(
+    "/api/v1/plan-weight-swap",
+    response_model=PlanWeightSwapResponse,
+    tags=["balance"],
+)
+def plan_weight_swap_endpoint(
+    req: PlanWeightSwapRequest,
+) -> PlanWeightSwapResponse:
+    def _weight_vectors(w):
+        a = math.radians(w.azimuth)
+        return w.mass * w.radius * math.sin(a), w.mass * w.radius * math.cos(a)
+
+    weights = []
+    for w in sorted(req.weights, key=lambda w: w.id):
+        wx, wy = _weight_vectors(w)
+        weights.append(
+            SwapWeight(
+                id=w.id,
+                mass=w.mass,
+                radius=w.radius,
+                azimuth_deg=w.azimuth,
+                mx=wx,
+                my=wy,
+            )
+        )
+
+    plan = plan_weight_swap(
+        fixed_parts=[(p.mass, p.radius, p.azimuth) for p in req.fixed_parts],
+        weights=weights,
+        current_ids=list(req.current_ids),
+        target_ids=list(req.target_ids),
+        installed_mass_limit=req.installed_mass_limit,
+        residual_moment_limit=req.residual_moment_limit,
+    )
+
+    def _moment(rx: float, ry: float) -> MomentVector2:
+        return MomentVector2(east=round(rx, 9), north=round(ry, 9))
+
+    nearest = None
+    if plan.nearest_blocked is not None:
+        b = plan.nearest_blocked
+        nearest = NearestBlockedItem(
+            action=ACTION_TYPE_NAMES[b.action_type],
+            weight_id=b.weight_id,
+            from_installed_ids=list(b.from_installed_ids),
+            total_mass=round(b.total_mass, 9),
+            mass_excess=round(b.mass_excess, 9),
+            residual=_moment(b.residual_x, b.residual_y),
+            residual_magnitude=round(b.residual_magnitude, 9),
+            moment_excess=round(b.moment_excess, 9),
+        )
+
+    return PlanWeightSwapResponse(
+        feasible=plan.feasible,
+        steps=[
+            SwapStepItem(
+                index=s.index,
+                action=ACTION_TYPE_NAMES[s.action_type],
+                weight_id=s.weight_id,
+                installed_ids=list(s.installed_ids),
+                total_mass=round(s.total_mass, 9),
+                residual=_moment(s.residual_x, s.residual_y),
+                residual_magnitude=round(s.residual_magnitude, 9),
+            )
+            for s in plan.steps
+        ],
+        reachable_states=plan.reachable_states,
+        nearest_blocked=nearest,
+        details={
+            "current_ids": sorted(req.current_ids),
+            "target_ids": sorted(req.target_ids),
+            "fixed_part_count": len(req.fixed_parts),
+            "weight_ids": list(plan.weight_ids),
+            "installed_mass_limit": round(req.installed_mass_limit, 9),
+            "residual_moment_limit": round(req.residual_moment_limit, 9),
+            "start": {
+                "total_mass": round(plan.start_mass, 9),
+                "residual": _moment(plan.start_x, plan.start_y).model_dump(),
+                "residual_magnitude": round(plan.start_magnitude, 9),
+            },
+            "goal": {
+                "total_mass": round(plan.goal_mass, 9),
+                "residual": _moment(plan.goal_x, plan.goal_y).model_dump(),
+                "residual_magnitude": round(plan.goal_magnitude, 9),
+            },
         },
     )

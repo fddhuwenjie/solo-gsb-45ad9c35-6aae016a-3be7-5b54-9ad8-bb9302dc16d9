@@ -15,6 +15,7 @@ from .planner.calibration import (
     MAX_LAG_CANDIDATES,
     unwrap_shortest_arc,
 )
+from .planner.swap import MAX_WEIGHTS as SWAP_MAX_WEIGHTS
 
 
 class TrackRequest(BaseModel):
@@ -640,4 +641,126 @@ class PlanDomeBalanceResponse(BaseModel):
         "max_scenarios_per_plan（单方案最多偏差情景数）、"
         "mass_vector（按槽位 ID 排列的质量向量，未使用槽位记 0）、"
         "slot_ids（质量向量各分量对应的槽位 ID）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/plan-weight-swap
+# ---------------------------------------------------------------------------
+
+
+class SwapWeightItem(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="可操作配重 ID（非空字符串，请求内唯一）"
+    )
+    mass: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="配重质量（>= 0；零质量不贡献质量矩）"
+    )
+    radius: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="配重质心到旋转轴的半径（>= 0）"
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="配重方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+
+
+class PlanWeightSwapRequest(BaseModel):
+    fixed_parts: list[InstalledPart] = Field(
+        ..., description="固定部件清单（始终在位、不可拆装；可为空列表）"
+    )
+    weights: list[SwapWeightItem] = Field(
+        ..., min_length=1, max_length=SWAP_MAX_WEIGHTS,
+        description="可操作配重（1..12 件，ID 唯一）",
+    )
+    current_ids: list[str] = Field(
+        ..., description="当前在位配重 ID 列表（须为 weights 子集，不重复）"
+    )
+    target_ids: list[str] = Field(
+        ..., description="目标在位配重 ID 列表（须为 weights 子集，不重复）；"
+        "目标外配重允许中途临时在位，终点必须全部拆除",
+    )
+    installed_mass_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="在位总质量上限（>= 0，含固定部件质量）",
+    )
+    residual_moment_limit: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="残余质量矩模长限值（>= 0，含固定部件矩）",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PlanWeightSwapRequest":
+        ids = [w.id for w in self.weights]
+        if len(set(ids)) != len(ids):
+            raise ValueError("weights 的 id 必须唯一")
+        known = set(ids)
+        if len(set(self.current_ids)) != len(self.current_ids):
+            raise ValueError("current_ids 不得包含重复 ID")
+        if len(set(self.target_ids)) != len(self.target_ids):
+            raise ValueError("target_ids 不得包含重复 ID")
+        unknown_current = [i for i in self.current_ids if i not in known]
+        if unknown_current:
+            raise ValueError(
+                f"current_ids 包含未知配重 ID：{unknown_current[0]!r}"
+            )
+        unknown_target = [i for i in self.target_ids if i not in known]
+        if unknown_target:
+            raise ValueError(
+                f"target_ids 包含未知配重 ID：{unknown_target[0]!r}"
+            )
+        return self
+
+
+class SwapStepItem(BaseModel):
+    index: int = Field(..., description="步骤序号（1 基）")
+    action: Literal["install", "remove"] = Field(
+        ..., description="动作类型：install 装上 / remove 拆下（一次一件）"
+    )
+    weight_id: str = Field(..., description="本步操作的配重 ID")
+    installed_ids: list[str] = Field(
+        ..., description="本步结束后的在位配重 ID（按 ID 升序；含固定部件除外的可操作配重）"
+    )
+    total_mass: float = Field(..., description="本步结束后的在位总质量（含固定部件）")
+    residual: MomentVector2 = Field(
+        ..., description="本步结束后的残余质量矩向量（含固定部件）"
+    )
+    residual_magnitude: float = Field(..., description="本步结束后的残余质量矩模长")
+
+
+class NearestBlockedItem(BaseModel):
+    action: Literal["install", "remove"] = Field(..., description="被阻断动作类型")
+    weight_id: str = Field(..., description="被阻断动作操作的配重 ID")
+    from_installed_ids: list[str] = Field(
+        ..., description="动作源状态（可达状态）的在位配重 ID（升序）"
+    )
+    total_mass: float = Field(..., description="若执行该动作，落点在位总质量")
+    mass_excess: float = Field(
+        ..., description="总质量超限量 max(0, 总质量 − 在位质量上限)"
+    )
+    residual: MomentVector2 = Field(..., description="若执行该动作，落点残余质量矩向量")
+    residual_magnitude: float = Field(
+        ..., description="若执行该动作，落点残余质量矩模长"
+    )
+    moment_excess: float = Field(
+        ..., description="质量矩超限量 max(0, 残余模长 − 残余质量矩限值)"
+    )
+
+
+class PlanWeightSwapResponse(BaseModel):
+    feasible: bool = Field(..., description="是否存在满足全部安全约束的换装路径")
+    steps: list[SwapStepItem] = Field(
+        ..., description="动作最少的安全路径（每步动作、在位 ID、残余向量与模长）；"
+        "无路时为空列表"
+    )
+    reachable_states: int = Field(
+        ..., description="自起点安全可达的状态（在位子集）数量；起点本身计入"
+    )
+    nearest_blocked: NearestBlockedItem | None = Field(
+        ..., description="无路时阻断动作中离可行最近的一步"
+        "（依次按质量矩超限量、总质量超限量、动作字典序最小）；有路径时为 null"
+    )
+    details: dict = Field(
+        ..., description="诊断信息：当前/目标在位 ID、配重 ID 顺序、固定部件数、"
+        "限值、起点与终点的总质量/残余向量/模长等"
     )
